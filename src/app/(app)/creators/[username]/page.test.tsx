@@ -10,12 +10,26 @@ vi.mock('next/navigation', () => ({
 
 vi.mock('next/link', () => ({
   default: ({ children, href, ...props }: { children: React.ReactNode; href: string }) => (
-    <a href={href} {...props}>{children}</a>
+    <a href={href} {...props}>
+      {children}
+    </a>
   ),
 }));
 
 vi.mock('dorisio-sdk/react', () => ({
   useDorisio: () => ({ client: { getCreatorProfile } }),
+  // The page renders SupporterCommissionRequest, which uses the SDK tip hook.
+  useCreateTip: () => ({
+    createTip: vi.fn().mockResolvedValue({ id: 'tip-1', status: 'confirmed' }),
+    buildTransaction: vi.fn(),
+    submitTransaction: vi.fn(),
+    confirmTransaction: vi.fn(),
+    data: null,
+    loading: false,
+    error: null,
+    step: undefined,
+    reset: vi.fn(),
+  }),
 }));
 
 vi.mock('@/hooks/use-creator-balance', () => ({
@@ -23,7 +37,13 @@ vi.mock('@/hooks/use-creator-balance', () => ({
 }));
 
 vi.mock('@/hooks/use-transaction-history', () => ({
-  useTransactionHistory: () => ({ transactions: [], total: 0, pageSize: 10, page: 1, loading: false }),
+  useTransactionHistory: () => ({
+    transactions: [],
+    total: 0,
+    pageSize: 10,
+    page: 1,
+    loading: false,
+  }),
 }));
 
 vi.mock('@/components/sections/dorisio-button', () => ({
@@ -44,11 +64,11 @@ describe('CreatorProfilePage', () => {
     createdAt: '2025-01-01T00:00:00.000Z',
   };
 
-  beforeEach(() => {
+  beforeEach((): void => {
     vi.clearAllMocks();
   });
 
-  it('shows the loading state while the profile request is pending', () => {
+  it('shows the loading state while the profile request is pending', (): void => {
     getCreatorProfile.mockReturnValue(new Promise(() => undefined));
 
     render(<CreatorProfilePage />);
@@ -56,7 +76,7 @@ describe('CreatorProfilePage', () => {
     expect(screen.getByRole('status', { name: 'Loading creator profile' })).toBeInTheDocument();
   });
 
-  it('shows a not-found error when profile loading fails', async () => {
+  it('shows a not-found error when profile loading fails', async (): Promise<void> => {
     getCreatorProfile.mockRejectedValue(new Error('Profile unavailable'));
 
     render(<CreatorProfilePage />);
@@ -65,7 +85,7 @@ describe('CreatorProfilePage', () => {
     expect(screen.getByText('Profile unavailable')).toBeInTheDocument();
   });
 
-  it('renders profile data after loading succeeds', async () => {
+  it('renders profile data after loading succeeds', async (): Promise<void> => {
     getCreatorProfile.mockResolvedValue(creator);
 
     render(<CreatorProfilePage />);
@@ -76,7 +96,7 @@ describe('CreatorProfilePage', () => {
     await waitFor(() => expect(getCreatorProfile).toHaveBeenCalledWith('creator-one'));
   });
 
-  it('renders the configured live stream on the creator profile', async () => {
+  it('renders the configured live stream on the creator profile', async (): Promise<void> => {
     getCreatorProfile.mockResolvedValue({
       ...creator,
       liveStream: {

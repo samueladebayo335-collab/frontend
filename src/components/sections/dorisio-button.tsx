@@ -17,10 +17,10 @@ import {
 } from '@/components/ui/modal';
 import { useCreateTip } from '@/hooks/use-create-tip';
 import { useWallet } from '@/hooks/use-wallet';
+import { captureFeatureEvent, useFeatureFlag } from '@/lib/feature-flags';
 import { WalletSelector } from '@/components/sections/wallet-selector';
 import { useNotification } from '@/components/notification-provider';
 import { dedupedRequest } from '@/lib/request-deduplicator';
-import { WalletSelector } from '@/components/sections/wallet-selector';
 import { useTipTiers } from '@/hooks/use-tip-tiers';
 import { useScheduledTips } from '@/hooks/use-scheduled-tips';
 import { DateTimePicker } from '@/components/ui/date-time-picker';
@@ -31,8 +31,6 @@ import {
   TIP_MESSAGE_MAX_LENGTH,
   validateTipMessage,
 } from '@/lib/tip-message';
-import { EmojiPicker } from '@/components/shared/emoji-picker';
-import { useWallet } from '@/hooks/use-wallet';
 
 interface DorisioButtonProps {
   creatorId: string;
@@ -44,6 +42,43 @@ interface DorisioButtonProps {
 }
 
 const QUICK_EMOJIS = ['👏', '🔥', '💛', '🙌', '✨', '🚀'];
+const STROOPS_PER_XLM = 10_000_000;
+
+interface TipReview {
+  amount: number;
+  fee: number;
+  walletId: string;
+}
+
+function getEstimatedFee(transaction: unknown): number {
+  if (!transaction || typeof transaction !== 'object' || !('fee' in transaction)) {
+    throw new Error('The transaction fee estimate is unavailable. Please try again.');
+  }
+
+  const fee = Number((transaction as { fee: unknown }).fee);
+  if (!Number.isFinite(fee) || fee < 0) {
+    throw new Error('The transaction fee estimate is invalid. Please try again.');
+  }
+
+  return fee;
+}
+
+function formatEstimatedFee(feeInStroops: number): string {
+  return `${(feeInStroops / STROOPS_PER_XLM).toFixed(7)} XLM`;
+}
+
+function formatTipAmount(amount: number): string {
+  return amount.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 7,
+  });
+}
+
+function getTransactionStatus(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object' || !('status' in result)) return undefined;
+  const { status } = result as { status: unknown };
+  return typeof status === 'string' ? status : undefined;
+}
 
 export default function DorisioButton({
   creatorId,
@@ -61,6 +96,9 @@ export default function DorisioButton({
   const [customAmountError, setCustomAmountError] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [messageError, setMessageError] = useState<string | null>(null);
+  const [tipReview, setTipReview] = useState<TipReview | null>(null);
+  const [preparingTip, setPreparingTip] = useState(false);
+  const [submittingTip, setSubmittingTip] = useState(false);
 
   // Scheduling states
   const [isScheduled, setIsScheduled] = useState(false);
@@ -68,23 +106,28 @@ export default function DorisioButton({
   const [scheduledDateError, setScheduledDateError] = useState<string | null>(null);
   const [frequency, setFrequency] = useState<ScheduledTipFrequency>('once');
 
-  const { createTip, loading } = useCreateTip();
+  const { createTip, buildTransaction, submitTransaction, confirmTransaction, loading, reset } =
+    useCreateTip();
   const { scheduleTip } = useScheduledTips(creatorId);
   const { success, error: notifyError } = useNotification();
-  const { wallets, getPreferredWalletId, setLastUsedWallet } = useWallet();
+  const { wallets, fetchWallets, getPreferredWalletId, setLastUsedWallet, selectWallet } =
+    useWallet();
+  const schedulingEnabled = useFeatureFlag('scheduled_tips', true) !== false;
   const {
     tiers: activeTiers,
     recentCustomAmounts,
     addRecentCustomAmount,
   } = useTipTiers(creatorId, propTipTiers);
-  const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
-  const [selectedAmount, setSelectedAmount] = useState<number | null>(null);
-  const [message, setMessage] = useState('');
-  const { createTip, loading } = useCreateTip();
-  const { success: notifySuccess, error: notifyError } = useNotification();
 
   // Auto-select preferred wallet when modal opens
   useEffect(() => {
+    if (isOpen && wallets.length === 0) {
+      void fetchWallets().catch(() => {
+        // The wallet selector owns its empty/error presentation; opening the
+        // tip dialog must not leave an unhandled promise rejection.
+      });
+    }
+
     if (isOpen && !selectedWalletId) {
       const preferredId = getPreferredWalletId(creatorId);
       if (preferredId && wallets.some((w) => w.id === preferredId)) {
@@ -93,7 +136,7 @@ export default function DorisioButton({
         setSelectedWalletId(wallets[0].id);
       }
     }
-  }, [isOpen, selectedWalletId, creatorId, wallets, getPreferredWalletId]);
+  }, [isOpen, selectedWalletId, creatorId, wallets, getPreferredWalletId, fetchWallets]);
 
   const sizeClasses = {
     sm: 'px-3 py-1 text-sm',
@@ -124,9 +167,12 @@ export default function DorisioButton({
     },
   ];
 
-  function handleClose(open: boolean): void {
+  function handleClose(open: boolean, force = false): void {
+    if (!open && !force && (loading || preparingTip || submittingTip)) return;
     setIsOpen(open);
     if (!open) {
+      setTipReview(null);
+      reset();
       setSelectedAmount(null);
       setSelectedWalletId(null);
       setIsCustom(false);
@@ -174,7 +220,18 @@ export default function DorisioButton({
   }
 
   async function handleSendTip(): Promise<void> {
-    if (!selectedAmount || !selectedWalletId || loading || Boolean(customAmountError)) return;
+    if (
+      !selectedAmount ||
+      !selectedWalletId ||
+      loading ||
+      preparingTip ||
+      submittingTip ||
+      Boolean(customAmountError)
+    )
+      return;
+
+    const amount = selectedAmount;
+    const walletId = selectedWalletId;
 
     if (isScheduled) {
       if (!scheduledDate) {
@@ -199,48 +256,98 @@ export default function DorisioButton({
       scheduleTip({
         creatorId,
         creatorName,
-        amount: selectedAmount,
+        amount,
         scheduledDate,
         frequency,
         walletId: selectedWalletId,
         message: normalizedMsg || undefined,
       });
 
-      if (isCustom && selectedAmount > 0) {
-        addRecentCustomAmount(selectedAmount);
+      if (isCustom && amount > 0) {
+        addRecentCustomAmount(amount);
       }
-      setLastUsedWallet(creatorId, selectedWalletId);
+      setLastUsedWallet(creatorId, walletId);
       const freqLabel = frequency === 'once' ? '' : ` (${frequency})`;
       success(
-        `Tip of $${selectedAmount} scheduled for ${scheduledDate.toLocaleDateString()}${freqLabel}!`,
+        `Tip of $${amount} scheduled for ${scheduledDate.toLocaleDateString()}${freqLabel}!`,
         'Tip Scheduled'
       );
       handleClose(false);
       return;
     }
 
-    // Immediate tip path
-    const dedupeKey = `create-tip:${creatorId}:${selectedAmount}:${selectedWalletId}:${normalizedMsg}`;
+    const dedupeKey = `create-tip:${creatorId}:${amount}:${walletId}:${normalizedMsg}`;
 
     try {
-      await dedupedRequest(
-        () =>
-          createTip({
-            creatorId,
-            amount: selectedAmount,
-            message: normalizedMsg || undefined,
-          }),
-        dedupeKey
-      );
-      if (isCustom && selectedAmount > 0) {
-        addRecentCustomAmount(selectedAmount);
+      setPreparingTip(true);
+      const fee = await dedupedRequest(async () => {
+        const wallet = wallets.find((candidate) => candidate.id === walletId);
+        if (!wallet) throw new Error('The selected wallet is no longer available.');
+        selectWallet(wallet);
+        await createTip({
+          creatorId,
+          amount,
+          message: normalizedMsg || undefined,
+        });
+        return getEstimatedFee(await buildTransaction());
+      }, dedupeKey);
+      setTipReview({ amount, fee, walletId });
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : 'Failed to prepare tip';
+      captureFeatureEvent('tip_failed', { amount });
+      notifyError(errMessage, 'Tip failed');
+    } finally {
+      setPreparingTip(false);
+    }
+  }
+
+  async function handleConfirmTip(): Promise<void> {
+    if (!tipReview || loading || preparingTip || submittingTip) return;
+
+    const { amount, walletId } = tipReview;
+    setSubmittingTip(true);
+    try {
+      const submission = await submitTransaction();
+      const submissionStatus = getTransactionStatus(submission);
+      if (submissionStatus === 'failed' || submissionStatus === 'error') {
+        captureFeatureEvent('tip_failed', { amount, scheduled: false });
+        notifyError('The payment could not be completed. Please try again.', 'Tip failed');
+        return;
       }
-      setLastUsedWallet(creatorId, selectedWalletId);
-      success(`Tip of $${selectedAmount} sent!`, 'Thank you');
-      handleClose(false);
+
+      let finalResult = submission;
+      try {
+        finalResult = (await confirmTransaction()) ?? submission;
+      } catch {
+        // The submission may still confirm asynchronously.
+      }
+
+      const status = getTransactionStatus(finalResult) ?? submissionStatus;
+      if (status === 'failed' || status === 'error') {
+        captureFeatureEvent('tip_failed', { amount, scheduled: false });
+        notifyError('The payment could not be completed. Please try again.', 'Tip failed');
+        return;
+      }
+
+      captureFeatureEvent('tip_succeeded', { amount, scheduled: false });
+      if (isCustom && amount > 0) {
+        addRecentCustomAmount(amount);
+      }
+      setLastUsedWallet(creatorId, walletId);
+      const paymentConfirmed = status === 'confirmed' || status === 'success';
+      success(
+        paymentConfirmed
+          ? `Tip of $${amount} confirmed!`
+          : `Tip of $${amount} submitted. Confirmation is pending.`,
+        paymentConfirmed ? 'Thank you' : 'Payment pending'
+      );
+      handleClose(false, true);
     } catch (err) {
       const errMessage = err instanceof Error ? err.message : 'Failed to send tip';
+      captureFeatureEvent('tip_failed', { amount });
       notifyError(errMessage, 'Tip failed');
+    } finally {
+      setSubmittingTip(false);
     }
   }
 
@@ -256,10 +363,46 @@ export default function DorisioButton({
       <Modal open={isOpen} onOpenChange={handleClose}>
         <ModalContent>
           <ModalHeader>
-            <ModalTitle>Send a Tip</ModalTitle>
-            <ModalDescription>Support this creator with an instant USDC payment</ModalDescription>
+            <ModalTitle>{tipReview ? 'Review Tip' : 'Send a Tip'}</ModalTitle>
+            <ModalDescription>
+              {tipReview
+                ? 'Review the tip amount and estimated network fee before confirming.'
+                : preparingTip
+                  ? 'Preparing the transaction and estimating its network fee.'
+                  : 'Support this creator with an instant USDC payment'}
+            </ModalDescription>
           </ModalHeader>
-          <div className="px-6 py-4 space-y-4">
+          {tipReview && (
+            <div className="px-6 py-4 space-y-4" aria-label="Tip total breakdown">
+              <p className="font-semibold" data-testid="tip-confirmation-question">
+                Send ${formatTipAmount(tipReview.amount)} tip to {creatorName ?? 'this creator'}?
+              </p>
+              <div className="flex justify-between gap-4 text-sm">
+                <span>Recipient</span>
+                <span>{creatorName ?? 'This creator'}</span>
+              </div>
+              <div className="flex justify-between gap-4 text-sm">
+                <span>Tip amount</span>
+                <span>${formatTipAmount(tipReview.amount)} USDC</span>
+              </div>
+              <div className="flex justify-between gap-4 text-sm">
+                <span>Estimated network fee</span>
+                <span>{formatEstimatedFee(tipReview.fee)}</span>
+              </div>
+              <div className="flex justify-between gap-4 border-t pt-3 font-semibold">
+                <span>Total</span>
+                <span>
+                  ${formatTipAmount(tipReview.amount)} USDC + {formatEstimatedFee(tipReview.fee)}
+                </span>
+              </div>
+            </div>
+          )}
+          {preparingTip && (
+            <div className="px-6 py-8 text-center text-sm text-muted-foreground" role="status">
+              Preparing transaction and fee estimate...
+            </div>
+          )}
+          <div className="px-6 py-4 space-y-4" hidden={Boolean(tipReview || preparingTip)}>
             <p className="text-sm text-muted-foreground">Creator ID: {creatorId}</p>
 
             {/* Wallet Selector */}
@@ -377,99 +520,101 @@ export default function DorisioButton({
             </div>
 
             {/* Scheduled Tips Section */}
-            <div className="pt-2 border-t space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <span className="text-sm font-medium">Schedule for future delivery</span>
-                  <p className="text-xs text-muted-foreground">
-                    Plan tips for birthdays, special dates, or recurring support
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !isScheduled;
-                    setIsScheduled(next);
-                    if (next && !scheduledDate) {
-                      const tomorrow = new Date();
-                      tomorrow.setDate(tomorrow.getDate() + 1);
-                      setScheduledDate(tomorrow);
-                      setScheduledDateError(null);
-                    }
-                  }}
-                  aria-pressed={isScheduled}
-                  className={`px-3 py-1 text-xs font-semibold rounded border transition ${
-                    isScheduled
-                      ? 'bg-primary text-primary-foreground border-primary'
-                      : 'hover:bg-muted text-foreground'
-                  }`}
-                >
-                  {isScheduled ? 'Scheduled ✓' : 'Schedule Tip ⏰'}
-                </button>
-              </div>
-
-              {isScheduled && (
-                <div className="p-3 bg-muted/30 border rounded-lg space-y-3 animate-fade-in">
-                  <div className="space-y-1.5">
-                    <label htmlFor="scheduled-date-picker" className="text-xs font-medium">
-                      Select Delivery Date & Time:
-                    </label>
-                    <DateTimePicker
-                      id="scheduled-date-picker"
-                      selected={scheduledDate}
-                      onChange={(date: Date | null) => {
-                        setScheduledDate(date);
-                        if (date && date.getTime() > Date.now()) {
-                          setScheduledDateError(null);
-                        } else if (date) {
-                          setScheduledDateError('Scheduled date must be in the future');
-                        }
-                      }}
-                      disabled={loading}
-                      minDate={new Date()}
-                    />
-                    {scheduledDateError && (
-                      <p role="alert" className="text-xs text-destructive">
-                        {scheduledDateError}
-                      </p>
-                    )}
+            {schedulingEnabled && (
+              <div className="pt-2 border-t space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="text-sm font-medium">Schedule for future delivery</span>
+                    <p className="text-xs text-muted-foreground">
+                      Plan tips for birthdays, special dates, or recurring support
+                    </p>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !isScheduled;
+                      setIsScheduled(next);
+                      if (next && !scheduledDate) {
+                        const tomorrow = new Date();
+                        tomorrow.setDate(tomorrow.getDate() + 1);
+                        setScheduledDate(tomorrow);
+                        setScheduledDateError(null);
+                      }
+                    }}
+                    aria-pressed={isScheduled}
+                    className={`px-3 py-1 text-xs font-semibold rounded border transition ${
+                      isScheduled
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'hover:bg-muted text-foreground'
+                    }`}
+                  >
+                    {isScheduled ? 'Scheduled ✓' : 'Schedule Tip ⏰'}
+                  </button>
+                </div>
 
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-medium">Repeat frequency:</label>
-                    <div
-                      className="grid grid-cols-4 gap-1.5"
-                      role="radiogroup"
-                      aria-label="Recurring frequency"
-                    >
-                      {(
-                        [
-                          { value: 'once', label: 'One-time' },
-                          { value: 'daily', label: 'Daily' },
-                          { value: 'weekly', label: 'Weekly' },
-                          { value: 'monthly', label: 'Monthly' },
-                        ] as const
-                      ).map((opt) => (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          onClick={() => setFrequency(opt.value)}
-                          aria-checked={frequency === opt.value}
-                          role="radio"
-                          className={`py-1.5 px-2 text-xs font-medium rounded border transition text-center ${
-                            frequency === opt.value
-                              ? 'bg-primary text-primary-foreground border-primary font-semibold'
-                              : 'bg-background hover:bg-muted text-foreground'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      ))}
+                {isScheduled && (
+                  <div className="p-3 bg-muted/30 border rounded-lg space-y-3 animate-fade-in">
+                    <div className="space-y-1.5">
+                      <label htmlFor="scheduled-date-picker" className="text-xs font-medium">
+                        Select Delivery Date & Time:
+                      </label>
+                      <DateTimePicker
+                        id="scheduled-date-picker"
+                        selected={scheduledDate}
+                        onChange={(date: Date | null) => {
+                          setScheduledDate(date);
+                          if (date && date.getTime() > Date.now()) {
+                            setScheduledDateError(null);
+                          } else if (date) {
+                            setScheduledDateError('Scheduled date must be in the future');
+                          }
+                        }}
+                        disabled={loading}
+                        minDate={new Date()}
+                      />
+                      {scheduledDateError && (
+                        <p role="alert" className="text-xs text-destructive">
+                          {scheduledDateError}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-medium">Repeat frequency:</label>
+                      <div
+                        className="grid grid-cols-4 gap-1.5"
+                        role="radiogroup"
+                        aria-label="Recurring frequency"
+                      >
+                        {(
+                          [
+                            { value: 'once', label: 'One-time' },
+                            { value: 'daily', label: 'Daily' },
+                            { value: 'weekly', label: 'Weekly' },
+                            { value: 'monthly', label: 'Monthly' },
+                          ] as const
+                        ).map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            onClick={() => setFrequency(opt.value)}
+                            aria-checked={frequency === opt.value}
+                            role="radio"
+                            className={`py-1.5 px-2 text-xs font-medium rounded border transition text-center ${
+                              frequency === opt.value
+                                ? 'bg-primary text-primary-foreground border-primary font-semibold'
+                                : 'bg-background hover:bg-muted text-foreground'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
 
             {/* Message input */}
             <div className="space-y-3 mt-5">
@@ -536,24 +681,36 @@ export default function DorisioButton({
           <ModalFooter>
             <button
               onClick={() => handleClose(false)}
-              disabled={loading}
+              disabled={loading || preparingTip || submittingTip}
               className="px-4 py-2 text-sm border rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Cancel
             </button>
             <button
-              onClick={handleSendTip}
+              onClick={tipReview ? handleConfirmTip : handleSendTip}
               disabled={
-                !selectedAmount ||
-                !selectedWalletId ||
-                loading ||
-                Boolean(messageError) ||
-                Boolean(customAmountError) ||
-                (isScheduled && (!scheduledDate || Boolean(scheduledDateError)))
+                tipReview
+                  ? loading || preparingTip || submittingTip
+                  : !selectedAmount ||
+                    !selectedWalletId ||
+                    loading ||
+                    preparingTip ||
+                    submittingTip ||
+                    Boolean(messageError) ||
+                    Boolean(customAmountError) ||
+                    (isScheduled && (!scheduledDate || Boolean(scheduledDateError)))
               }
               className="px-4 py-2 text-sm bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? 'Sending...' : isScheduled ? 'Schedule Tip' : 'Continue'}
+              {submittingTip || loading
+                ? 'Sending...'
+                : preparingTip
+                  ? 'Preparing fee...'
+                  : tipReview
+                    ? 'Confirm & Send'
+                    : isScheduled
+                      ? 'Schedule Tip'
+                      : 'Continue'}
             </button>
           </ModalFooter>
         </ModalContent>

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Megaphone,
   Plus,
@@ -19,6 +19,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
+import { useSafeTimeout } from '@/hooks/use-timeout';
 import {
   useAnnouncementStore,
   type Announcement,
@@ -51,6 +52,7 @@ export function CreatorAnnouncementPanel({
   const pinAnnouncement = useAnnouncementStore((state) => state.pinAnnouncement);
   const archiveAnnouncement = useAnnouncementStore((state) => state.archiveAnnouncement);
   const deleteAnnouncement = useAnnouncementStore((state) => state.deleteAnnouncement);
+  const { schedule } = useSafeTimeout();
 
   const [isOpenForm, setIsOpenForm] = useState(false);
   const [title, setTitle] = useState('');
@@ -59,32 +61,41 @@ export function CreatorAnnouncementPanel({
   const [mediaUrl, setMediaUrl] = useState('');
   const [mediaType, setMediaType] = useState<AnnouncementMediaType>('image');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const submissionInProgress = useRef(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim() || !body.trim()) return;
+    if (submissionInProgress.current || !title.trim() || !body.trim()) return;
 
-    const media: AnnouncementMedia[] = mediaUrl.trim()
-      ? [{ type: mediaType, url: mediaUrl.trim() }]
-      : [];
+    submissionInProgress.current = true;
+    setIsSubmitting(true);
+    try {
+      const media: AnnouncementMedia[] = mediaUrl.trim()
+        ? [{ type: mediaType, url: mediaUrl.trim() }]
+        : [];
 
-    const created = createAnnouncement(creatorId, {
-      title,
-      body,
-      media,
-      pinned,
-      creatorName,
-    });
+      const created = createAnnouncement(creatorId, {
+        title,
+        body,
+        media,
+        pinned,
+        creatorName,
+      });
 
-    onAnnouncementCreated?.(created);
+      onAnnouncementCreated?.(created);
 
-    setTitle('');
-    setBody('');
-    setMediaUrl('');
-    setPinned(false);
-    setIsOpenForm(false);
-    setSuccessMessage('Announcement published to your followers!');
-    setTimeout(() => setSuccessMessage(null), 4000);
+      setTitle('');
+      setBody('');
+      setMediaUrl('');
+      setPinned(false);
+      setIsOpenForm(false);
+      setSuccessMessage('Announcement published to your followers!');
+      schedule(() => setSuccessMessage(null), 4000);
+    } finally {
+      submissionInProgress.current = false;
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -196,8 +207,12 @@ export function CreatorAnnouncementPanel({
               <Button type="button" variant="outline" onClick={() => setIsOpenForm(false)}>
                 Cancel
               </Button>
-              <Button type="submit" data-testid="publish-announcement-button">
-                Publish Announcement
+              <Button
+                type="submit"
+                disabled={isSubmitting}
+                data-testid="publish-announcement-button"
+              >
+                {isSubmitting ? 'Publishing...' : 'Publish Announcement'}
               </Button>
             </div>
           </form>

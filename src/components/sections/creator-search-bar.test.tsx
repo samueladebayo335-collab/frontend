@@ -1,14 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {
-  CreatorSearchBar,
-  RECENT_SEARCHES_KEY,
-} from './creator-search-bar';
+import { CreatorSearchBar, RECENT_SEARCHES_KEY } from './creator-search-bar';
 import type { CreatorSearchFilters } from '@/hooks/use-creator-search';
 import type { Creator } from '@/types';
 
 const baseFilters: CreatorSearchFilters = {
+  category: '',
   search: '',
   verifiedOnly: false,
   minEarnings: '',
@@ -235,9 +233,49 @@ describe('CreatorSearchBar', () => {
         vi.advanceTimersByTime(300);
       });
 
-      expect(
-        screen.getByText(/No creators found for “nonexistent-person”/i)
-      ).toBeInTheDocument();
+      expect(screen.getByText(/No creators found for “nonexistent-person”/i)).toBeInTheDocument();
+    });
+
+    it('offers a Clear search action in the empty state that resets the query', () => {
+      vi.useFakeTimers();
+      const onChange = vi.fn();
+
+      render(
+        <CreatorSearchBar
+          filters={{ ...baseFilters, search: 'nonexistent-person' }}
+          onChange={onChange}
+          onReset={vi.fn()}
+          creators={testCreators}
+        />
+      );
+
+      fireEvent.focus(screen.getByLabelText('Search creators'));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Clear search' }));
+      expect(onChange).toHaveBeenCalledWith('search', '');
+    });
+
+    it('does not show the empty message while the query still has matches', () => {
+      vi.useFakeTimers();
+
+      render(
+        <CreatorSearchBar
+          filters={{ ...baseFilters, search: 'bob' }}
+          onChange={vi.fn()}
+          onReset={vi.fn()}
+          creators={testCreators}
+        />
+      );
+
+      fireEvent.focus(screen.getByLabelText('Search creators'));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+
+      expect(screen.queryByTestId('search-no-results')).not.toBeInTheDocument();
     });
 
     it('selecting a suggestion calls onChange, onSelectCreator, and closes dropdown', () => {

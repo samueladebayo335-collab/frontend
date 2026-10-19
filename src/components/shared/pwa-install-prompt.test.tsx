@@ -3,7 +3,7 @@
  */
 
 import { render, screen } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { PWAInstallPrompt } from './pwa-install-prompt';
 
 describe('PWAInstallPrompt', () => {
@@ -18,13 +18,6 @@ describe('PWAInstallPrompt', () => {
   });
 
   it('renders when beforeinstallprompt event fires', () => {
-    // Mock the event
-    const mockEvent = {
-      preventDefault: vi.fn(),
-      prompt: vi.fn(),
-      userChoice: Promise.resolve({ outcome: 'accepted' }),
-    };
-
     render(<PWAInstallPrompt />);
 
     // Simulate the event
